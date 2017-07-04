@@ -1,87 +1,140 @@
 import os
+import aiohttp
 import asyncio
 import argparse
-import requests
 
 from bs4 import BeautifulSoup
-from urllib.parse import urlsplit, urlunsplit, parse_qs, urlencode
 
-from utils import get_logger, get_filepath
-import download_utils
+from utils import get_logger, get_filepath, get_url
+from job_queue import JobQueue
 
 
-def download_arxiv_papers(url, all=False, quiet=False, verbose=False, output_dir="", loop=None):
-    logger = get_logger()
-    logger.info("URL: {}".format(url))
-    logger.info("Download All? {}".format(all))
-    logger.info("Output Directory? {}".format(output_dir))
-    logger.info("Quiet? {}".format(quiet))
-    logger.info("Verbose? {}".format(verbose))
+def submit_job(batch, queue, output_dir=""):
+    """Adds file to batch entry and adds it to JobQueue
+    """
+    for b in batch:
+        # Add output filepath to the batch entry
+        b['file'] = get_filepath(output_dir, b['title'])
 
-    if not all:
-        download_one(url, output_dir=output_dir, loop=loop)
-        return
+        # Submit the entry to JobQueue
+        queue.submit(b)
+
+
+@asyncio.coroutine
+def extract_and_submit(url, queue, all=False, output_dir=""):
+    """Extracts links to research papers and submits job to JobQueue
+    """
+    if all == False:
+        links = yield from get_batch(url)
+        submit_job(links, queue, output_dir=output_dir)
+        return None
 
     skip = 0
-    count = True  # Simulate do-while loop
+    page_size = 25
+    links = [True]  # do-while loop simulation
 
-    while count != 0:
-        u = urlsplit(url)
-        q = parse_qs(u.query)
-        q['skip'] = skip
-        q['per_page'] = 3
-        q['query_id'] = q['query_id'][0]
+    while links:
+        url = get_url(url, skip, page_size)
+        links = yield from get_batch(url)
+        submit_job(links, queue, output_dir=output_dir)
+        skip += page_size
 
-        url = urlunsplit((u.scheme, u.netloc, u.path, urlencode(q), u.fragment))
-        count = download_one(url, output_dir=output_dir, loop=loop)
-
-        skip += 3
+    return None
 
 
-def download_one(url, output_dir="", loop=None):
+def get_batch(url):
+    """Returns the batch containing the links and titles of the research paper
+    to download
+    """
     logger = get_logger()
+    content = None
+
     logger.info("Requesting URL: " + url)
-    r = requests.get(url)
 
-    logger.debug("Response status code {}".format(r.status_code))
+    # Grabbing the session
+    session = aiohttp.ClientSession()
 
-    if r.status_code != 200:
-        logger.error("Received {} while hitting URL {}".format(r.status_code, url))
+    # Hitting the URL
+    r = yield from session.get(url)
 
-    soup = BeautifulSoup(r.content, "html.parser")
-    links = ['https://arxiv.org' + dt.find("a", text="pdf").get("href") for dt in soup.findAll("dt")]
-    titles = [dd.find("div", {"class": "list-title"}).contents[2] for dd in soup.findAll("dd")]
+    logger.debug("Response status code {}".format(r.status))
+    if r.status != 200:
+        logger.error("Received {} while hitting URL {}".format(r.status, url))
 
+    # Reading Contents
+    content = yield from r.text()
+
+    # Closing and Cleaning
+    r.close()
+    session.close()
+
+    # Extracting Links and Titles
+    soup = BeautifulSoup(content, "html.parser")
+    links = []
+    for dt in soup.findAll("dt"):
+        a = dt.find("a", text="pdf")
+        if a:
+            links.append('https://arxiv.org' + a.get('href'))
+        else:
+            links.append(None)
+
+    titles = [ dd.find("div", {"class": "list-title"}).contents[2]
+               for dd in soup.findAll("dd") ]
+
+    # Error case - should not occur though!
     if len(links) != len(titles):
         logger.error("Number of links and titles do not match.")
-        logger.error("links = {} and titles = {}".format(len(links), len(titles)))
-        return
+        logger.error("links = {} and titles = {}".format(len(links),
+                                                         len(titles)))
+        raise Exception("Something is wrong with the script")
 
-    batch = [{'link': x[0],
-              'title': x[1],
-              'file': get_filepath(output_dir, x[1])
-             } for x in zip(links, titles)]
+    # Compiling batch
+    batch = [{'link': x[0], 'title': x[1]} for x in zip(links, titles) if x[0]]
 
     logger.info("Found {} pdfs".format(len(batch)))
-    download_utils.download_batch(batch, loop=loop)
-
-    return len(batch)
+    return batch
 
 
 if __name__ == '__main__':
     loop = asyncio.get_event_loop()
 
-    parser = argparse.ArgumentParser(description='Download all research papers (pdfs) from arxiv')
-    parser.add_argument('url', type=str, help='search url')
-    parser.add_argument('--output-dir', type=str, help='Output Directory where all PDFs should be saved', default="")
-    parser.add_argument('--all', help='go through all pages and download all', action="store_true")
-    parser.add_argument('-q', '--quiet', help='No output', action="store_true")
-    parser.add_argument('-v', '--verbose', help='All sort of output', action="store_true")
+    # Argument Parser
+    parser = argparse.ArgumentParser(description='Download all research'
+                                     ' papers (pdfs) from arxiv.org')
+    parser.add_argument('url', type=str, help='search url; it should have'
+                        ' query_id parameter in it. It will look something like'
+                        ' this: "https://arxiv.org/find/all/1/all:+Wikipedia/0/'
+                        '1/0/all/0/1?skip=0&query_id=a82ebfd0195719df"')
+    parser.add_argument('--output-dir', type=str, help='Output directory where'
+                        ' all PDFs should be saved', default="")
+    parser.add_argument('--all', help='Go through all pages and download'
+                        ' everything', action="store_true")
+    parser.add_argument('-q', '--quiet', help='No output at all',
+                        action="store_true")
+    parser.add_argument('-v', '--verbose', help='All sort of output messages',
+                        action="store_true")
 
     args = parser.parse_args().__dict__
-    url = args.pop('url')
+    url = args['url']
 
     # Initializing logger
     get_logger(quiet=args.get('quiet'), verbose=args.get('verbose'))
 
-    download_arxiv_papers(url, loop=loop, **args)
+    logger = get_logger()
+    logger.info("URL: {}".format(url))
+    logger.info("Download All? {}".format(args['all']))
+    logger.info("Output Directory? {}".format(args['output_dir']))
+    logger.info("Quiet? {}".format(args['quiet']))
+    logger.info("Verbose? {}".format(args['verbose']))
+
+    del args['url']
+    del args['quiet']
+    del args['verbose']
+
+    queue = JobQueue(loop)
+
+    loop.run_until_complete(asyncio.gather(
+        queue.start(),
+        extract_and_submit(url, queue, **args),
+    ))
+    loop.close()
